@@ -75,7 +75,7 @@ jobs:
             library: libdatachannel-java.dll
           - classifier: macos-arm64
             family: macos
-            runner: macos-26
+            runner: macos-15
             task: compileNativeForHost
             directory: host
             library: libdatachannel-java.dylib
