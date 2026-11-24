@@ -12,7 +12,7 @@ The `stackanvil` branch is the upstream commit StackAnvil pins, plus these chang
 
 | Patch | Upstream |
 | --- | --- |
-| `libjuice/0001-discard-unauthenticated-error-responses-to-checks.patch` | Not submitted yet. Branch [AlexProgrammerDE/libjuice@authenticate-check-error-responses](https://github.com/AlexProgrammerDE/libjuice/tree/authenticate-check-error-responses). |
+| `libjuice/0001-discard-unauthenticated-and-late-error-responses-to-checks.patch` | Not submitted yet. Branch [AlexProgrammerDE/libjuice@authenticate-check-error-responses](https://github.com/AlexProgrammerDE/libjuice/tree/authenticate-check-error-responses). |
 
 Drop a patch once the submodule it targets contains the change.
 

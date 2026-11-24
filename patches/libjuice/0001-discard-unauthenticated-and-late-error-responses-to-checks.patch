@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 21:44:44 +0100
-Subject: [PATCH] Discard unauthenticated error responses to checks
+Subject: [PATCH] Discard unauthenticated and late error responses to checks
 
 Connectivity checks use the STUN short-term credential mechanism, and
 RFC 8489 9.1.4 requires a response without valid MESSAGE-INTEGRITY
@@ -20,11 +20,20 @@ one.
 
 Verify error responses to checks like other Binding responses and
 discard them when integrity is missing or invalid. Authenticated error
-responses, such as 487 Role Conflict, are processed as before.
+responses, such as 487 Role Conflict, are processed as before. Since
+such peers send these 401s in normal operation, log discarded error
+responses at debug level.
+
+A check's transaction ID also stayed valid after its success response
+until the next check. A late response to one of its retransmissions,
+for example an error from the session a copy reached by mistake, could
+still fail the pair. Replace the ID once the transaction succeeds.
 
 Add a test where the peer answers one consent check on the selected
-pair with an unauthenticated 401, which must not fail the pair, and
-one where it answers with an authenticated 400, which must.
+pair with an unauthenticated 401, which must not fail the pair, one
+where it answers with an authenticated 400, which must, and one where
+an authenticated 400 follows the success of its transaction, which
+must not.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 094acbc99f357feac7cb61a3dbfd260184d73de0..129da2cf9ca63a24e091122cd6ad7bb205d94bf9 100644
@@ -39,7 +48,7 @@ index 094acbc99f357feac7cb61a3dbfd260184d73de0..129da2cf9ca63a24e091122cd6ad7bb2
  	${CMAKE_CURRENT_SOURCE_DIR}/test/ufrag.c
  	${CMAKE_CURRENT_SOURCE_DIR}/test/tcp.c
 diff --git a/src/agent.c b/src/agent.c
-index a90f25603d0ccc52ed55fea7d688f57eb21ebf21..b9e8fe93852ae63e4140ed595c986fe0a2891132 100644
+index a90f25603d0ccc52ed55fea7d688f57eb21ebf21..4bf0541dd5e4be57caeca832e28a08a1a92e1104 100644
 --- a/src/agent.c
 +++ b/src/agent.c
 @@ -1346,7 +1346,7 @@ int agent_verify_stun_binding(juice_agent_t *agent, void *buf, size_t size,
@@ -51,7 +60,7 @@ index a90f25603d0ccc52ed55fea7d688f57eb21ebf21..b9e8fe93852ae63e4140ed595c986fe0
  		return 0;
  
  	if (!msg->has_integrity) {
-@@ -1477,8 +1477,14 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
+@@ -1477,9 +1477,21 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
  	switch (msg->msg_method) {
  	case STUN_METHOD_BINDING:
  		// Message was verified earlier, no need to re-verify
@@ -63,16 +72,35 @@ index a90f25603d0ccc52ed55fea7d688f57eb21ebf21..b9e8fe93852ae63e4140ed595c986fe0
 +		// with an unauthenticated 401, which must not fail the candidate pair.
  		if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && !msg->has_integrity &&
 -		    (msg->msg_class == STUN_CLASS_REQUEST || msg->msg_class == STUN_CLASS_RESP_SUCCESS)) {
+-			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
 +		    msg->msg_class != STUN_CLASS_INDICATION) {
- 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
++			// A server that shares its port answers some checks with an unauthenticated 401 in
++			// normal operation, so these are not worth a warning
++			if (msg->msg_class == STUN_CLASS_RESP_ERROR)
++				JLOG_DEBUG("Ignoring unauthenticated STUN Binding error response, code=%u",
++				           (unsigned int)msg->error_code);
++			else
++				JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
  			return -1;
+ 		}
+ 		return agent_process_stun_binding(agent, msg, entry, src, relayed);
+@@ -1701,6 +1713,10 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
+ 				           agent->mode == AGENT_MODE_CONTROLLING ? "controlling" : "controlled");
+ 				pair->nominated = true;
+ 			}
++
++			// The transaction is complete. Replace its ID so that a late response to one of its
++			// retransmissions cannot match the entry anymore. The next request draws a new ID.
++			juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);
+ 		} else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
+ 			agent_update_gathering_done(agent);
  		}
 diff --git a/test/error-integrity.c b/test/error-integrity.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101b9e6ceea
+index 0000000000000000000000000000000000000000..5611949313036680f16c99160f7fde22a71cb380
 --- /dev/null
 +++ b/test/error-integrity.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,205 @@
 +/**
 + * Copyright (c) 2026
 + *
@@ -140,8 +168,10 @@ index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101
 +}
 +
 +// The peer is a bare socket that answers every check, except that it answers one consent check on
-+// the selected pair with an error response. Returns whether the agent failed.
-+static int run(unsigned int error_code, bool authenticated, bool *agent_failed) {
++// the selected pair with an error response. With late, it answers that check with a success first
++// and sends the error afterwards, as for a retransmission that reached another session. Returns
++// whether the agent failed.
++static int run(unsigned int error_code, bool authenticated, bool late, bool *agent_failed) {
 +	failed = false;
 +
 +	juice_config_t config;
@@ -211,9 +241,12 @@ index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101
 +
 +		unsigned int code = 0;
 +		if (!error_sent && juice_get_state(agent) == JUICE_STATE_COMPLETED) {
-+			printf("Peer answers a consent check with %s %u\n",
++			printf("Peer answers a consent check with %s%s %u\n",
++			       late ? "a success and a late " : "",
 +			       authenticated ? "authenticated" : "unauthenticated", error_code);
 +			error_sent = true;
++			if (late)
++				answer(sock, &request, (struct sockaddr *)&source, source_len, 0, true);
 +			code = error_code;
 +		} else if (error_sent) {
 +			++checks_after_error;
@@ -247,7 +280,7 @@ index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101
 +	// RFC 8489 9.1.3: a peer that does not know the username fragment answers with a 401, which
 +	// it cannot authenticate. RFC 8489 9.1.4: over UDP, the agent must discard such a response.
 +	bool unauthenticated_failed = false;
-+	if (run(401, false, &unauthenticated_failed) || unauthenticated_failed) {
++	if (run(401, false, false, &unauthenticated_failed) || unauthenticated_failed) {
 +		fprintf(stderr, "An unauthenticated 401 failed the selected pair\n");
 +		printf("Failure\n");
 +		return -1;
@@ -255,8 +288,16 @@ index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101
 +
 +	// An authenticated unrecoverable error still fails the pair (RFC 8445 7.2.5.2.4)
 +	bool authenticated_failed = false;
-+	if (run(400, true, &authenticated_failed) || !authenticated_failed) {
++	if (run(400, true, false, &authenticated_failed) || !authenticated_failed) {
 +		fprintf(stderr, "An authenticated 400 did not fail the selected pair\n");
++		printf("Failure\n");
++		return -1;
++	}
++
++	// An error that arrives after its transaction succeeded answers nothing pending anymore
++	bool late_failed = false;
++	if (run(400, true, true, &late_failed) || late_failed) {
++		fprintf(stderr, "A late authenticated 400 after a success failed the selected pair\n");
 +		printf("Failure\n");
 +		return -1;
 +	}
