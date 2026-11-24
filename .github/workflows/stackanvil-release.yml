@@ -1,0 +1,97 @@
+name: StackAnvil release
+
+# Builds the patched natives for every target and publishes the Java facade and the
+# bundle of all natives as assets of an immutable GitHub release. StackAnvil pins
+# those assets by checksum instead of building this project itself.
+
+on:
+  push:
+    tags: [ 'v*-stackanvil.*' ]
+
+concurrency:
+  group: stackanvil-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGETS: linux-glibc-x86_64,linux-glibc-aarch64,linux-musl-x86_64,linux-musl-aarch64,windows-x86_64,windows-aarch64,macos-arm64,macos-x86_64
+
+jobs:
+  build-natives:
+    uses: ./.github/workflows/native-builds.yml
+
+  release:
+    name: Publish release
+    needs: [ build-natives ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-tags: 'true'
+          fetch-depth: '0'
+          submodules: recursive
+
+      - name: Apply StackAnvil patches
+        run: scripts/apply-stackanvil-patches.sh
+
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Download native libraries
+        uses: actions/download-artifact@v7
+        with:
+          pattern: libdatachannel-*
+          path: artifacts
+
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          ./gradlew --no-configuration-cache \
+            :jar :generatePomFileForMavenPublication \
+            :libdatachannel-java-arch-detect:jar :libdatachannel-java-arch-detect:generatePomFileForMavenPublication \
+            -Plibdatachannel.development-version="$version" \
+            -Plibdatachannel.targets="$TARGETS" \
+            -Plibdatachannel.linux-glibc-x86_64.prebuilt-path=artifacts/libdatachannel-linux-glibc-x86_64/libdatachannel-java.so \
+            -Plibdatachannel.linux-glibc-aarch64.prebuilt-path=artifacts/libdatachannel-linux-glibc-aarch64/libdatachannel-java.so \
+            -Plibdatachannel.linux-musl-x86_64.prebuilt-path=artifacts/libdatachannel-linux-musl-x86_64/libdatachannel-java.so \
+            -Plibdatachannel.linux-musl-aarch64.prebuilt-path=artifacts/libdatachannel-linux-musl-aarch64/libdatachannel-java.so \
+            -Plibdatachannel.windows-x86_64.prebuilt-path=artifacts/libdatachannel-windows-x86_64/libdatachannel-java.dll \
+            -Plibdatachannel.windows-aarch64.prebuilt-path=artifacts/libdatachannel-windows-aarch64/libdatachannel-java.dll \
+            -Plibdatachannel.macos-arm64.prebuilt-path=artifacts/libdatachannel-macos-arm64/libdatachannel-java.dylib \
+            -Plibdatachannel.macos-x86_64.prebuilt-path=artifacts/libdatachannel-macos-x86_64/libdatachannel-java.dylib
+
+          mkdir release
+          cp "build/libs/libdatachannel-java-$version.jar" release/
+          cp build/publications/maven/pom-default.xml "release/libdatachannel-java-$version.pom"
+          cp "arch-detect/build/libs/libdatachannel-java-arch-detect-$version.jar" release/
+          cp arch-detect/build/publications/maven/pom-default.xml "release/libdatachannel-java-arch-detect-$version.pom"
+
+          # Every target's native library must be in the bundle
+          for target in ${TARGETS//,/ }; do
+            unzip -l "release/libdatachannel-java-arch-detect-$version.jar" | grep -q " $target/native/" \
+              || { echo "::error::The bundle has no $target native library"; exit 1; }
+          done
+          (cd release && sha256sum * > SHA256SUMS)
+          cat release/SHA256SUMS
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Upload to a draft first: assets cannot change once an immutable release is published
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+            --notes "libdatachannel-java built from $GITHUB_SHA with the patches in patches/. Checksums are in SHA256SUMS."
+          gh release upload "$TAG" release/*
+          gh release edit "$TAG" --draft=false
