@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AlexProgrammerDE <40795980+AlexProgrammerDE@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:44:44 +0100
+Subject: [PATCH] Discard unauthenticated error responses to checks
+
+Connectivity checks use the STUN short-term credential mechanism, and
+RFC 8489 9.1.4 requires a response without valid MESSAGE-INTEGRITY
+received over an unreliable transport to be discarded, as if it had
+never been received, so that retransmissions continue.
+
+The agent applied this to success responses but not to error responses:
+it skipped integrity verification for them and failed the candidate
+pair on any error other than 487. A peer that does not recognize the
+username fragment answers with a 401 it cannot authenticate (RFC 8489
+9.1.3), for instance when a server that shares one port between
+sessions routes a check to the wrong one. A single such response to a
+consent check on the selected pair ended the connection with "Lost
+connectivity". Anyone able to observe a transaction ID could also send
+one.
+
+Verify error responses to checks like other Binding responses and
+discard them when integrity is missing or invalid. Authenticated error
+responses, such as 487 Role Conflict, are processed as before.
+
+Add a test where the peer answers one consent check on the selected
+pair with an unauthenticated 401, which must not fail the pair, and
+one where it answers with an authenticated 400, which must.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 094acbc99f357feac7cb61a3dbfd260184d73de0..129da2cf9ca63a24e091122cd6ad7bb205d94bf9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,6 +84,7 @@ set(TESTS_SOURCES
+     ${CMAKE_CURRENT_SOURCE_DIR}/test/notrickle.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/test/server.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/test/conflict.c
++    ${CMAKE_CURRENT_SOURCE_DIR}/test/error-integrity.c
+     ${CMAKE_CURRENT_SOURCE_DIR}/test/bind.c
+ 	${CMAKE_CURRENT_SOURCE_DIR}/test/ufrag.c
+ 	${CMAKE_CURRENT_SOURCE_DIR}/test/tcp.c
+diff --git a/src/agent.c b/src/agent.c
+index a90f25603d0ccc52ed55fea7d688f57eb21ebf21..b9e8fe93852ae63e4140ed595c986fe0a2891132 100644
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -1346,7 +1346,7 @@ int agent_verify_stun_binding(juice_agent_t *agent, void *buf, size_t size,
+ 	if (msg->msg_method != STUN_METHOD_BINDING)
+ 		return -1;
+ 
+-	if (msg->msg_class == STUN_CLASS_INDICATION || msg->msg_class == STUN_CLASS_RESP_ERROR)
++	if (msg->msg_class == STUN_CLASS_INDICATION)
+ 		return 0;
+ 
+ 	if (!msg->has_integrity) {
+@@ -1477,8 +1477,14 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
+ 	switch (msg->msg_method) {
+ 	case STUN_METHOD_BINDING:
+ 		// Message was verified earlier, no need to re-verify
++		// RFC 8489 9.1.4. Receiving a Response:
++		// If [...] both MESSAGE-INTEGRITY and MESSAGE-INTEGRITY-SHA256 are absent, [and] the
++		// request was sent over an unreliable transport, the response MUST be discarded, as if it
++		// had never been received. This means that retransmits, if applicable, will continue.
++		// This covers error responses too: a peer that does not know the username fragment answers
++		// with an unauthenticated 401, which must not fail the candidate pair.
+ 		if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && !msg->has_integrity &&
+-		    (msg->msg_class == STUN_CLASS_REQUEST || msg->msg_class == STUN_CLASS_RESP_SUCCESS)) {
++		    msg->msg_class != STUN_CLASS_INDICATION) {
+ 			JLOG_WARN("Missing integrity in STUN Binding message from remote peer, ignoring");
+ 			return -1;
+ 		}
+diff --git a/test/error-integrity.c b/test/error-integrity.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..db89ea2b257c20cfde7dea667117b101b9e6ceea
+--- /dev/null
++++ b/test/error-integrity.c
+@@ -0,0 +1,192 @@
++/**
++ * Copyright (c) 2026
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++
++#include "juice/juice.h"
++
++#include "socket.h"
++#include "stun.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#ifdef _WIN32
++#include <windows.h>
++static int64_t now_ms(void) { return (int64_t)GetTickCount64(); }
++#else
++#include <time.h>
++static int64_t now_ms(void) {
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++#endif
++
++#define PEER_UFRAG "peer"
++#define PEER_PWD "peerpeerpeerpeerpeerpeer"
++#define BUFFER_SIZE 4096
++#define CHECKS_AFTER_ERROR 2
++#define WAIT_TIME 20000 // msecs
++
++static volatile bool failed;
++
++static void on_state_changed(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
++	(void)agent;
++	(void)user_ptr;
++	if (state == JUICE_STATE_FAILED)
++		failed = true;
++}
++
++static void answer(socket_t sock, const stun_message_t *request, const struct sockaddr *source,
++                   socklen_t source_len, unsigned int error_code, bool authenticated) {
++	stun_message_t response;
++	memset(&response, 0, sizeof(response));
++	response.msg_class = error_code ? STUN_CLASS_RESP_ERROR : STUN_CLASS_RESP_SUCCESS;
++	response.msg_method = STUN_METHOD_BINDING;
++	response.error_code = error_code;
++	memcpy(response.transaction_id, request->transaction_id, STUN_TRANSACTION_ID_SIZE);
++	if (!error_code) {
++		memcpy(&response.mapped.addr, source, source_len);
++		response.mapped.len = source_len;
++	}
++
++	char buffer[BUFFER_SIZE];
++	// Success responses are always authenticated, only the error response may not be
++	int size = _juice_stun_write(buffer, sizeof(buffer), &response,
++	                             error_code && !authenticated ? NULL : PEER_PWD);
++	if (size > 0)
++		sendto(sock, buffer, size, 0, source, source_len);
++}
++
++// The peer is a bare socket that answers every check, except that it answers one consent check on
++// the selected pair with an error response. Returns whether the agent failed.
++static int run(unsigned int error_code, bool authenticated, bool *agent_failed) {
++	failed = false;
++
++	juice_config_t config;
++	memset(&config, 0, sizeof(config));
++	config.cb_state_changed = on_state_changed;
++	juice_agent_t *agent = juice_create(&config);
++	if (!agent)
++		return -1;
++
++	// Asking for the local description first makes the agent the controlling one
++	char sdp[JUICE_MAX_SDP_STRING_LEN];
++	juice_get_local_description(agent, sdp, sizeof(sdp));
++
++	socket_t sock = socket(AF_INET, SOCK_DGRAM, 0);
++	struct sockaddr_in bound;
++	memset(&bound, 0, sizeof(bound));
++	bound.sin_family = AF_INET;
++	inet_pton(AF_INET, "127.0.0.1", &bound.sin_addr);
++	socklen_t bound_len = sizeof(bound);
++	if (sock == INVALID_SOCKET || bind(sock, (struct sockaddr *)&bound, sizeof(bound)) != 0 ||
++	    getsockname(sock, (struct sockaddr *)&bound, &bound_len) != 0) {
++		fprintf(stderr, "Could not open the peer socket\n");
++		juice_destroy(agent);
++		return -1;
++	}
++
++	char remote[JUICE_MAX_SDP_STRING_LEN];
++	snprintf(remote, sizeof(remote), "a=ice-ufrag:%s\na=ice-pwd:%s\n", PEER_UFRAG, PEER_PWD);
++	char candidate[128];
++	snprintf(candidate, sizeof(candidate), "a=candidate:1 1 UDP 2130706431 127.0.0.1 %hu typ host",
++	         (unsigned short)ntohs(bound.sin_port));
++	if (juice_set_remote_description(agent, remote) != JUICE_ERR_SUCCESS ||
++	    juice_add_remote_candidate(agent, candidate) != JUICE_ERR_SUCCESS ||
++	    juice_set_remote_gathering_done(agent) != JUICE_ERR_SUCCESS ||
++	    juice_gather_candidates(agent) != JUICE_ERR_SUCCESS) {
++		fprintf(stderr, "Could not set up the agent\n");
++		closesocket(sock);
++		juice_destroy(agent);
++		return -1;
++	}
++
++	bool error_sent = false;
++	int checks_after_error = 0;
++	int64_t deadline = now_ms() + WAIT_TIME;
++	while (!failed && checks_after_error < CHECKS_AFTER_ERROR && now_ms() < deadline) {
++		struct pollfd pfd;
++		memset(&pfd, 0, sizeof(pfd));
++		pfd.fd = sock;
++		pfd.events = POLLIN;
++		if (poll(&pfd, 1, 100) <= 0)
++			continue;
++
++		char buffer[BUFFER_SIZE];
++		struct sockaddr_storage source;
++		socklen_t source_len = sizeof(source);
++		int size =
++		    (int)recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&source, &source_len);
++		if (size <= 0)
++			continue;
++
++		stun_message_t request;
++		memset(&request, 0, sizeof(request));
++		if (_juice_stun_read(buffer, size, &request) < 0 ||
++		    request.msg_class != STUN_CLASS_REQUEST || request.msg_method != STUN_METHOD_BINDING ||
++		    !_juice_stun_check_integrity(buffer, size, &request, PEER_PWD))
++			continue;
++
++		unsigned int code = 0;
++		if (!error_sent && juice_get_state(agent) == JUICE_STATE_COMPLETED) {
++			printf("Peer answers a consent check with %s %u\n",
++			       authenticated ? "authenticated" : "unauthenticated", error_code);
++			error_sent = true;
++			code = error_code;
++		} else if (error_sent) {
++			++checks_after_error;
++		}
++		answer(sock, &request, (struct sockaddr *)&source, source_len, code, authenticated);
++	}
++
++	// Give a failure caused by the error response time to show
++	int64_t settle = now_ms() + 1000;
++	while (!failed && now_ms() < settle)
++		poll(NULL, 0, 50);
++
++	closesocket(sock);
++	juice_destroy(agent);
++
++	if (!error_sent) {
++		fprintf(stderr, "The agent never completed\n");
++		return -1;
++	}
++	*agent_failed = failed;
++	return 0;
++}
++
++int test_error_integrity() {
++#if defined(JUICE_DISABLE_CONSENT_FRESHNESS) && JUICE_DISABLE_CONSENT_FRESHNESS
++	printf("Skipped, connected pairs send indications without consent freshness\n");
++	return 0;
++#else
++	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
++
++	// RFC 8489 9.1.3: a peer that does not know the username fragment answers with a 401, which
++	// it cannot authenticate. RFC 8489 9.1.4: over UDP, the agent must discard such a response.
++	bool unauthenticated_failed = false;
++	if (run(401, false, &unauthenticated_failed) || unauthenticated_failed) {
++		fprintf(stderr, "An unauthenticated 401 failed the selected pair\n");
++		printf("Failure\n");
++		return -1;
++	}
++
++	// An authenticated unrecoverable error still fails the pair (RFC 8445 7.2.5.2.4)
++	bool authenticated_failed = false;
++	if (run(400, true, &authenticated_failed) || !authenticated_failed) {
++		fprintf(stderr, "An authenticated 400 did not fail the selected pair\n");
++		printf("Failure\n");
++		return -1;
++	}
++
++	printf("Success\n");
++	return 0;
++#endif
++}
+diff --git a/test/main.c b/test/main.c
+index 4b7748b9de699192974fcc91944a6df209d3e5aa..016c60268309b2bac073612af355a275c54d461a 100644
+--- a/test/main.c
++++ b/test/main.c
+@@ -21,6 +21,7 @@ int test_notrickle(void);
+ int test_gathering(void);
+ int test_turn(void);
+ int test_conflict(void);
++int test_error_integrity(void);
+ int test_bind(void);
+ int test_ufrag(void);
+ int test_stun_unhandled(void);
+@@ -105,6 +106,12 @@ int main(int argc, char **argv) {
+ 		return -1;
+ 	}
+ 
++	printf("\nRunning check error response integrity test...\n");
++	if (test_error_integrity()) {
++		fprintf(stderr, "Check error response integrity test failed\n");
++		return -1;
++	}
++
+ 	printf("\nRunning connectivity test with bind address...\n");
+ 	if (test_bind()) {
+ 		fprintf(stderr, "Connectivity test with bind address failed\n");

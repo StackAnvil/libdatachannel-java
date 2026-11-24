@@ -90,6 +90,9 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+      - name: Apply StackAnvil patches
+        shell: bash
+        run: scripts/apply-stackanvil-patches.sh
       - uses: actions/setup-java@v5
         with:
           java-version: '17'
